@@ -69,6 +69,10 @@ EXCHANGE_ENDPOINTS = [
     ("/aspnet_client/", False),
 ]
 
+# Endpoints that speak NTLM — these enable unauthenticated, time-based
+# username enumeration (valid users respond measurably slower).
+NTLM_ENDPOINTS = {p for p, ntlm in EXCHANGE_ENDPOINTS if ntlm}
+
 # ---------------------------------------------------------------------------
 # Exchange build -> (product, cumulative update) table.
 # Not exhaustive; covers builds relevant to modern CVE triage. The minor build
@@ -609,6 +613,97 @@ class ExchangeRecon:
         return "CANDIDATE", ("Attack surface reachable but exact build not "
                              "disclosed — confirm version manually.")
 
+    # --- non-CVE weaknesses / exposures -----------------------------------
+    # Passive findings derived from what discovery already gathered — no extra
+    # traffic. These are the "недостатки" side of the methodology: info leaks,
+    # enum/spray surface, exposed admin/remoting endpoints, EOL software.
+    def _status_map(self) -> dict:
+        return {f.endpoint: f.status for f in self.findings}
+
+    def assess_weaknesses(self) -> list[dict]:
+        W: list[dict] = []
+        live = self.live_endpoints()
+        smap = self._status_map()
+
+        def add(wid, title, sev, evidence, ref):
+            W.append({"id": wid, "title": title, "severity": sev,
+                      "evidence": evidence, "ref": ref})
+
+        # End-of-life product in production.
+        if self.product in EOL_PRODUCTS:
+            add("eol-product",
+                f"End-of-life Exchange in production ({self.product})", "high",
+                f"{self.product} build {self.build or '?'} — no vendor security "
+                f"updates ship; permanently exposed to future CVEs.",
+                "methodology: patch state / §11")
+
+        # Internal AD/host disclosure via unauthenticated NTLM negotiate.
+        if self.domain_info:
+            bits = ", ".join(f"{k}={v}" for k, v in self.domain_info.items())
+            add("ntlm-internal-disclosure",
+                "Internal AD/host info disclosed via unauth NTLM", "medium",
+                bits, "methodology §1 (NTLMSSP fingerprint)")
+
+        # Exact build disclosed pre-auth (aids precise CVE targeting).
+        if self.build:
+            add("version-disclosure",
+                "Exact Exchange build disclosed pre-auth", "low",
+                f"build {self.build} via X-OWA-Version / OWA resource path",
+                "methodology §1")
+
+        # Username enumeration surface (no creds required).
+        ntlm_live = sorted(e for e in live if e in NTLM_ENDPOINTS)
+        if ntlm_live:
+            ev = "time-based NTLM enum via: " + ", ".join(ntlm_live)
+            if any("autodiscover" in e for e in live):
+                ev += ("; AutodiscoverV2 cookie method via "
+                       "/autodiscover/autodiscover.json")
+            add("user-enum-surface",
+                "Username enumeration surface exposed (no creds)", "medium",
+                ev, "methodology §2")
+
+        # Password-spray surface.
+        spray = [e for e in ("/owa/", "/EWS/Exchange.asmx",
+                             "/Microsoft-Server-ActiveSync",
+                             "/autodiscover/autodiscover.xml") if e in live]
+        if spray:
+            add("password-spray-surface",
+                "Auth endpoints exposed for password spraying", "medium",
+                "sprayable: " + ", ".join(spray), "methodology §3")
+
+        # ECP admin panel reachable.
+        if "/ecp/" in live:
+            add("ecp-exposed", "ECP admin panel reachable", "medium",
+                f"/ecp/ -> HTTP {smap.get('/ecp/')}",
+                "methodology §7 (ECP privilege abuse)")
+
+        # Remote PowerShell endpoint reachable.
+        if "/PowerShell/" in live:
+            add("powershell-exposed",
+                "Remote PowerShell endpoint reachable", "medium",
+                f"/PowerShell/ -> HTTP {smap.get('/PowerShell/')}",
+                "methodology §6 (ProxyShell PS backend)")
+
+        # ActiveSync exposed — classic MFA-bypass / spray vector.
+        if "/Microsoft-Server-ActiveSync" in live:
+            add("activesync-exposed",
+                "ActiveSync exposed (potential MFA-bypass / spray vector)",
+                "low",
+                f"/Microsoft-Server-ActiveSync -> "
+                f"HTTP {smap.get('/Microsoft-Server-ActiveSync')}",
+                "methodology §3")
+
+        # EWS present — SSRF-as-a-feature surface.
+        if "/EWS/Exchange.asmx" in live or "/EWS/" in live:
+            add("ews-ssrf-surface",
+                "EWS present (SSRF-as-feature: Subscribe / "
+                "CreateAttachmentFromUri)", "low",
+                "EWS endpoint reachable", "methodology §4")
+
+        sev_order = {"high": 0, "medium": 1, "low": 2, "info": 3}
+        W.sort(key=lambda w: sev_order.get(w["severity"], 9))
+        return W
+
     # --- report ------------------------------------------------------------
     def to_report(self) -> dict:
         return {
@@ -631,6 +726,7 @@ class ExchangeRecon:
                 }
                 for f in self.findings
             ],
+            "weaknesses": self.assess_weaknesses(),
             "cve_assessment": self.assess_cves(),
         }
 
@@ -681,6 +777,17 @@ def print_report(rep: dict):
         if e["ntlm"] and e["ntlm"].get("os_version"):
             extra = f"  {C.DIM}os={e['ntlm']['os_version']}{C.X}"
         print(f"  {col}{tag:>4}{C.X}  {e['endpoint']}{extra}")
+
+    weaknesses = rep.get("weaknesses", [])
+    if weaknesses:
+        sev_col = {"high": C.R, "medium": C.Y, "low": C.B, "info": C.DIM}
+        print(f"\n{C.BOLD}Weaknesses / exposures (non-CVE):{C.X}")
+        print(f"  {C.DIM}severity  finding{C.X}")
+        for w in weaknesses:
+            col = sev_col.get(w["severity"], "")
+            print(f"  {col}{w['severity']:<8}{C.X}  {w['title']}")
+            print(f"            {C.DIM}{w['evidence']}{C.X}")
+            print(f"            {C.DIM}ref: {w['ref']}{C.X}")
 
     mode = "active probes ON" if rep.get("active_mode") else "passive (version-based)"
     print(f"\n{C.BOLD}CVE assessment{C.X} {C.DIM}[{mode}]{C.X}")
