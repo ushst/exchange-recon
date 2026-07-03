@@ -31,9 +31,12 @@ import argparse
 import base64
 import concurrent.futures
 import dataclasses
+import hashlib
 import json
+import random
 import re
 import ssl
+import statistics
 import struct
 import sys
 import time
@@ -623,14 +626,18 @@ class ExchangeRecon:
     def _status_map(self) -> dict:
         return {f.endpoint: f.status for f in self.findings}
 
+    def _bare_host(self) -> str:
+        """host without scheme, for pasting into example commands."""
+        return self.host.split("://", 1)[-1]
+
     def assess_weaknesses(self) -> list[dict]:
         W: list[dict] = []
         live = self.live_endpoints()
         smap = self._status_map()
 
-        def add(wid, title, sev, evidence, ref):
+        def add(wid, title, sev, evidence, ref, hint):
             W.append({"id": wid, "title": title, "severity": sev,
-                      "evidence": evidence, "ref": ref})
+                      "evidence": evidence, "ref": ref, "hint": hint})
 
         # End-of-life product in production.
         if self.product in EOL_PRODUCTS:
@@ -638,32 +645,44 @@ class ExchangeRecon:
                 f"End-of-life Exchange in production ({self.product})", "high",
                 f"{self.product} build {self.build or '?'} — no vendor security "
                 f"updates ship; permanently exposed to future CVEs.",
-                "methodology: patch state / §11")
+                "methodology: patch state / §11",
+                "Treat as vulnerable to every post-EOL CVE. No patch will ever "
+                "come — the only fix is migration (Exchange SE). See CHEATSHEET.ru.md#eol-product.")
 
         # Internal AD/host disclosure via unauthenticated NTLM negotiate.
         if self.domain_info:
             bits = ", ".join(f"{k}={v}" for k, v in self.domain_info.items())
             add("ntlm-internal-disclosure",
                 "Internal AD/host info disclosed via unauth NTLM", "medium",
-                bits, "methodology §1 (NTLMSSP fingerprint)")
+                bits, "methodology §1 (NTLMSSP fingerprint)",
+                "Use the leaked NetBIOS/DNS domain to build DOMAIN\\user login "
+                "formats for enum & spray, seed AD recon, and identify relay "
+                "targets. See CHEATSHEET.ru.md#ntlm-internal-disclosure.")
 
         # Exact build disclosed pre-auth (aids precise CVE targeting).
         if self.build:
             add("version-disclosure",
                 "Exact Exchange build disclosed pre-auth", "low",
                 f"build {self.build} via X-OWA-Version / OWA resource path",
-                "methodology §1")
+                "methodology §1",
+                "Map the build to CVEs precisely (MS build-numbers table); hunt "
+                "for missing SUs. See CHEATSHEET.ru.md#version-disclosure.")
 
         # Username enumeration surface (no creds required).
         ntlm_live = sorted(e for e in live if e in NTLM_ENDPOINTS)
         if ntlm_live:
             ev = "time-based NTLM enum via: " + ", ".join(ntlm_live)
             if any("autodiscover" in e for e in live):
-                ev += ("; AutodiscoverV2 cookie method via "
+                ev += ("; AutodiscoverV2 method via "
                        "/autodiscover/autodiscover.json")
             add("user-enum-surface",
                 "Username enumeration surface exposed (no creds)", "medium",
-                ev, "methodology §2")
+                ev, "methodology §2",
+                f"Harvest valid usernames WITHOUT creds:\n"
+                f"      python3 exchange_recon.py {self._bare_host()} --enum -U users.txt\n"
+                f"      (AutodiscoverV2 + time-based NTLM). Alt: MailSniper "
+                f"Invoke-UsernameHarvestOWA, o365spray, kerbrute. "
+                f"See CHEATSHEET.ru.md#user-enum-surface.")
 
         # Password-spray surface.
         spray = [e for e in ("/owa/", "/EWS/Exchange.asmx",
@@ -672,20 +691,32 @@ class ExchangeRecon:
         if spray:
             add("password-spray-surface",
                 "Auth endpoints exposed for password spraying", "medium",
-                "sprayable: " + ", ".join(spray), "methodology §3")
+                "sprayable: " + ", ".join(spray), "methodology §3",
+                "After enum, spray ONE password across users respecting the "
+                "lockout policy: nxc (NetExec) owa/http, MailSniper "
+                "Invoke-PasswordSprayOWA, o365spray. See CHEATSHEET.ru.md#password-spray-surface.")
 
         # ECP admin panel reachable.
         if "/ecp/" in live:
             add("ecp-exposed", "ECP admin panel reachable", "medium",
                 f"/ecp/ -> HTTP {smap.get('/ecp/')}",
-                "methodology §7 (ECP privilege abuse)")
+                "methodology §7 (ECP privilege abuse)",
+                "ECP = Exchange admin panel. With valid creds: if the user holds "
+                "ApplicationImpersonation you can act as ANY mailbox; historic "
+                "ProxyShell/ProxyNotShell target; check /ecp/DDI/DDIService.svc, "
+                "default creds, and whether normal users can reach /ecp/ "
+                "(misconfig). See CHEATSHEET.ru.md#ecp-exposed.")
 
         # Remote PowerShell endpoint reachable.
         if "/PowerShell/" in live:
             add("powershell-exposed",
                 "Remote PowerShell endpoint reachable", "medium",
                 f"/PowerShell/ -> HTTP {smap.get('/PowerShell/')}",
-                "methodology §6 (ProxyShell PS backend)")
+                "methodology §6 (ProxyShell PS backend)",
+                "This is the backend ProxyShell abuses for RCE. With creds: "
+                "New-PSSession -ConfigurationName Microsoft.Exchange "
+                "-ConnectionUri https://host/PowerShell/ -> run Exchange cmdlets "
+                "(Get-Mailbox, New-MailboxExportRequest...). See CHEATSHEET.ru.md#powershell-exposed.")
 
         # ActiveSync exposed — classic MFA-bypass / spray vector.
         if "/Microsoft-Server-ActiveSync" in live:
@@ -694,14 +725,20 @@ class ExchangeRecon:
                 "low",
                 f"/Microsoft-Server-ActiveSync -> "
                 f"HTTP {smap.get('/Microsoft-Server-ActiveSync')}",
-                "methodology §3")
+                "methodology §3",
+                "EAS is often excluded from MFA/conditional access -> single-"
+                "factor mailbox access & a quieter spray channel. Test mail "
+                "access with one credential. See CHEATSHEET.ru.md#activesync-exposed.")
 
         # EWS present — SSRF-as-a-feature surface.
         if "/EWS/Exchange.asmx" in live or "/EWS/" in live:
             add("ews-ssrf-surface",
                 "EWS present (SSRF-as-feature: Subscribe / "
                 "CreateAttachmentFromUri)", "low",
-                "EWS endpoint reachable", "methodology §4")
+                "EWS endpoint reachable", "methodology §4",
+                "EWS Subscribe/CreateAttachmentFromUri give SSRF & NTLM-relay "
+                "triggers (CVE-2024-21410, PrivExchange). With creds: read/send "
+                "mail, delegate access. See CHEATSHEET.ru.md#ews-ssrf-surface.")
 
         sev_order = {"high": 0, "medium": 1, "low": 2, "info": 3}
         W.sort(key=lambda w: sev_order.get(w["severity"], 9))
@@ -732,6 +769,165 @@ class ExchangeRecon:
             "weaknesses": self.assess_weaknesses(),
             "cve_assessment": self.assess_cves(),
         }
+
+
+# ---------------------------------------------------------------------------
+# Username enumeration (separate --enum mode)
+#
+# Two no-credential techniques from methodology §2:
+#   * autodiscover : GET /autodiscover/autodiscover.json?Email=<u>&Protocol=...
+#                    and compare the response to an invalid-user control. A
+#                    real mailbox is routed to its backend and responds
+#                    differently (status / body / X-BackEndCookie).
+#   * timing       : send Basic auth <principal>:<bogus-pass> to an NTLM vdir
+#                    and measure latency. Valid users make the backend do more
+#                    work (slower); a per-run control baseline of random users
+#                    sets the threshold.
+#
+# Both are HEURISTIC and config-dependent. This is a CHECKER: it only decides
+# "valid / unknown" — it never sends a real password and never logs in.
+# ---------------------------------------------------------------------------
+@dataclasses.dataclass
+class EnumResult:
+    user: str
+    verdict: str          # "valid" | "unknown" | "invalid"
+    method: str
+    detail: str
+    elapsed_ms: float = 0.0
+
+
+class UserEnumerator:
+    def __init__(self, host: str, http: HttpClient, domain: Optional[str] = None,
+                 samples: int = 3):
+        self.host = host.rstrip("/")
+        if not self.host.startswith("http"):
+            self.host = "https://" + self.host
+        self.http = http
+        self.domain = domain
+        self.samples = max(1, samples)
+
+    # -- helpers -----------------------------------------------------------
+    @staticmethod
+    def _rand_user() -> str:
+        return "zz" + "".join(random.choices("abcdefghijklmnop", k=12))
+
+    def _principal(self, user: str) -> str:
+        """Format a login principal. Honor an explicit domain/UPN in the entry,
+        else prefix DOMAIN\\ if --domain was given."""
+        if "@" in user or "\\" in user:
+            return user
+        if self.domain:
+            return f"{self.domain}\\{user}"
+        return user
+
+    @staticmethod
+    def _body_sig(body: bytes) -> str:
+        return hashlib.sha1(body[:4096]).hexdigest()[:12]
+
+    # -- AutodiscoverV2 method --------------------------------------------
+    def _autodiscover_probe(self, email: str) -> dict:
+        path = (f"/autodiscover/autodiscover.json?Email={email}"
+                f"&Protocol=ActiveSync")
+        return self.http.request(self.host + path, allow_redirects=False)
+
+    def autodiscover(self, users: list[str]) -> list[EnumResult]:
+        # Control: a couple of definitely-invalid addresses to learn the
+        # "not found" fingerprint.
+        dom = self.domain or "invalid.local"
+        ctrl_sigs = set()
+        ctrl_status = set()
+        for _ in range(2):
+            r = self._autodiscover_probe(f"{self._rand_user()}@{dom}")
+            ctrl_sigs.add((r["status"], self._body_sig(r["body"])))
+            ctrl_status.add(r["status"])
+
+        out = []
+        for u in users:
+            email = u if "@" in u else (f"{u}@{self.domain}" if self.domain else u)
+            r = self._autodiscover_probe(email)
+            sig = (r["status"], self._body_sig(r["body"]))
+            cookie = r["headers"].get("set-cookie", "")
+            has_becookie = "x-backendcookie" in cookie.lower()
+            if r["error"]:
+                out.append(EnumResult(email, "unknown", "autodiscover",
+                                      f"request error: {r['error']}"))
+            elif has_becookie or sig not in ctrl_sigs:
+                out.append(EnumResult(
+                    email, "valid", "autodiscover",
+                    f"response differs from invalid-control "
+                    f"(status={r['status']}, backendcookie={has_becookie})",
+                    r["elapsed"] * 1000))
+            else:
+                out.append(EnumResult(email, "invalid", "autodiscover",
+                                      "matches invalid-control fingerprint",
+                                      r["elapsed"] * 1000))
+        return out
+
+    # -- time-based NTLM method -------------------------------------------
+    def _timing_probe(self, principal: str, endpoint: str) -> tuple:
+        """Return (best_elapsed_seconds, ok) where ok is True only if at least
+        one sample got a real HTTP response (status not None)."""
+        cred = base64.b64encode(
+            f"{principal}:Bogus-{self._rand_user()}".encode()).decode()
+        best = None
+        ok = False
+        for _ in range(self.samples):
+            r = self.http.request(self.host + endpoint, method="GET",
+                                  headers={"Authorization": "Basic " + cred},
+                                  allow_redirects=False)
+            if r["status"] is not None:
+                ok = True
+            e = r["elapsed"]
+            best = e if best is None else min(best, e)
+        return best or 0.0, ok
+
+    def timing(self, users: list[str],
+               endpoint: str = "/autodiscover/autodiscover.xml"
+               ) -> list[EnumResult]:
+        # Baseline from random invalid principals.
+        base = []
+        base_ok = 0
+        for _ in range(max(4, self.samples)):
+            t, ok = self._timing_probe(
+                self._principal(self._rand_user()), endpoint)
+            base.append(t)
+            base_ok += ok
+        # If the endpoint isn't actually answering, timing is meaningless —
+        # don't manufacture verdicts from network-error noise.
+        if base_ok == 0:
+            return [EnumResult(u, "unknown", "timing",
+                               f"endpoint {endpoint} not responding — "
+                               f"timing unavailable") for u in users]
+        b_mean = statistics.mean(base)
+        # Floor the spread so sub-millisecond float noise can't cross it; real
+        # Exchange latencies are tens of ms, so a 5 ms floor is conservative.
+        b_sd = max(statistics.pstdev(base), b_mean * 0.15, 0.005)
+        threshold = b_mean + 2 * b_sd
+
+        out = []
+        for u in users:
+            t, ok = self._timing_probe(self._principal(u), endpoint)
+            if not ok:
+                out.append(EnumResult(u, "unknown", "timing",
+                                      "no response for this probe"))
+                continue
+            verdict = "valid" if t >= threshold else "unknown"
+            out.append(EnumResult(
+                u, verdict, "timing",
+                f"{t*1000:.0f} ms vs baseline {b_mean*1000:.0f}±"
+                f"{b_sd*1000:.0f} ms (thr {threshold*1000:.0f})", t * 1000))
+        return out
+
+    def run(self, users: list[str], method: str) -> list[EnumResult]:
+        results: list[EnumResult] = []
+        if method in ("auto", "autodiscover"):
+            results += self.autodiscover(users)
+        if method in ("auto", "timing"):
+            # In auto mode, only timing-probe users not already found valid.
+            done = {r.user.split("@")[0] for r in results if r.verdict == "valid"}
+            pending = [u for u in users if u.split("@")[0] not in done]
+            results += self.timing(pending)
+        return results
 
 
 # ---------------------------------------------------------------------------
@@ -795,6 +991,8 @@ def print_report(rep: dict):
             col = sev_col.get(w["severity"], "")
             print(f"  {col}{w['severity']:<8}{C.X}  {w['title']}")
             print(f"            {C.DIM}{w['evidence']}{C.X}")
+            if w.get("hint"):
+                print(f"            {C.C}how-to: {w['hint']}{C.X}")
             print(f"            {C.DIM}ref: {w['ref']}{C.X}")
 
     mode = "active probes ON" if rep.get("active_mode") else "passive (version-based)"
@@ -821,6 +1019,31 @@ def print_report(rep: dict):
     print()
 
 
+def print_enum(results: list):
+    C = Color
+    valid = [r for r in results if r["verdict"] == "valid"]
+    print(f"\n{C.BOLD}Username enumeration{C.X} "
+          f"{C.DIM}(checker — no password sent){C.X}")
+    print(f"  {C.DIM}verdict  method        user  /  detail{C.X}")
+    for r in results:
+        if r["verdict"] == "valid":
+            col = C.G
+        elif r["verdict"] == "invalid":
+            col = C.DIM
+        else:
+            col = C.Y
+        print(f"  {col}{r['verdict']:<7}{C.X}  {r['method']:<12}  "
+              f"{r['user']}")
+        print(f"           {C.DIM}{r['detail']}{C.X}")
+    print(f"\n  {C.BOLD}{len(valid)} likely-valid / {len(results)} tested.{C.X}")
+    if valid:
+        print(f"  {C.DIM}Next: careful password spray of these (respect "
+              f"lockout) — see CHEATSHEET.ru.md#password-spray-surface.{C.X}")
+    print(f"  {C.DIM}Heuristic & config-dependent — confirm valids by a second "
+          f"method before spraying.{C.X}")
+    print()
+
+
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
@@ -836,12 +1059,17 @@ def read_targets(args) -> list[str]:
 _HELP_DESCRIPTION = """\
 exchange_recon — non-destructive on-prem Microsoft Exchange recon & CVE triage.
 
-DETECTION ONLY. No exploitation, no RCE, no writes, no password spraying, no
-user enumeration. It maps endpoints, fingerprints the exact build, extracts the
-AD domain/host/OS from an unauthenticated NTLM negotiate, then reports:
+NO exploitation, no RCE, no writes, no password spraying, no logins. Default run
+maps endpoints, fingerprints the exact build, extracts the AD domain/host/OS
+from an unauthenticated NTLM negotiate, then reports:
   * Weaknesses / exposures  — non-CVE findings (info leaks, enum/spray surface,
-                              exposed ECP/PowerShell/ActiveSync, EOL software)
+                              exposed ECP/PowerShell/ActiveSync, EOL software),
+                              each with a 'how-to' hint
   * CVE assessment          — split into unauthenticated vs. requires-credentials
+
+Opt-in separate mode:
+  * --enum  — no-credential username harvesting (AutodiscoverV2 + time-based
+              NTLM). A checker: decides valid/unknown, never sends a password.
 """
 
 _HELP_EPILOG = """\
@@ -861,6 +1089,10 @@ examples:
 
   # route everything through Burp/mitmproxy to inspect raw traffic
   exchange_recon.py mail.corp.com --proxy http://127.0.0.1:8080 --active
+
+  # username enumeration mode (no creds) — needs a user/email list
+  exchange_recon.py mail.corp.com --enum -U users.txt --domain CORP
+  exchange_recon.py mail.corp.com --enum -U emails.txt --enum-method autodiscover
 
 verdict legend (CVE):
   VULNERABLE  active probe confirmed the flaw (not exploited)
@@ -902,6 +1134,20 @@ def main(argv: Optional[list[str]] = None) -> int:
                    help="run active NON-DESTRUCTIVE confirmation probes "
                         "(ProxyLogon SSRF, ProxyShell path-confusion). "
                         "Confirms flaws without exploitation/RCE.")
+    enum = p.add_argument_group("username enumeration mode (--enum)")
+    enum.add_argument("--enum", action="store_true",
+                      help="separate no-cred username-harvest mode. Needs -U. "
+                           "Never sends a password.")
+    enum.add_argument("-U", "--userlist",
+                      help="file of users/emails to test (one per line)")
+    enum.add_argument("--enum-method",
+                      choices=["auto", "autodiscover", "timing"], default="auto",
+                      help="enum technique (default: auto = both)")
+    enum.add_argument("--domain",
+                      help="AD/NetBIOS domain or UPN suffix to qualify bare "
+                           "usernames (e.g. CORP or corp.com)")
+    enum.add_argument("--enum-samples", type=int, default=3,
+                      help="timing samples per user (default 3; more = stabler)")
     p.add_argument("--verify-tls", action="store_true",
                    help="verify TLS certs (default: off, self-signed common)")
     p.add_argument("--no-color", action="store_true", help="disable ANSI color")
@@ -918,6 +1164,17 @@ def main(argv: Optional[list[str]] = None) -> int:
     if args.no_color or not sys.stdout.isatty():
         Color.off()
 
+    if args.enum and not args.userlist:
+        p.error("--enum requires -U/--userlist")
+
+    users = []
+    if args.enum:
+        with open(args.userlist) as fh:
+            users = [ln.strip() for ln in fh if ln.strip()
+                     and not ln.startswith("#")]
+        if not users:
+            p.error(f"user list {args.userlist} is empty")
+
     http = HttpClient(timeout=args.timeout, verify=args.verify_tls,
                       proxy=args.proxy, ua=args.ua, verbose=args.verbose)
     reports = []
@@ -932,9 +1189,22 @@ def main(argv: Optional[list[str]] = None) -> int:
             print("interrupted", file=sys.stderr)
             return 130
         rep = rec.to_report()
+
+        if args.enum:
+            try:
+                enumr = UserEnumerator(tgt, http, domain=args.domain,
+                                       samples=args.enum_samples)
+                eres = enumr.run(users, args.enum_method)
+            except KeyboardInterrupt:
+                print("interrupted", file=sys.stderr)
+                return 130
+            rep["enum"] = [dataclasses.asdict(r) for r in eres]
+
         reports.append(rep)
         if not args.quiet:
             print_report(rep)
+            if args.enum:
+                print_enum(rep["enum"])
 
     if args.verbose:
         sys.stderr.write(f"[*] total HTTP requests sent: "

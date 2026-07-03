@@ -4,7 +4,9 @@ Non-destructive on-prem **Microsoft Exchange** reconnaissance & CVE triage — a
 
 > Discover Exchange → Fingerprint version → Enumerate endpoints → Map weaknesses & CVEs.
 
-It is **detection-only**. It performs **no exploitation, no RCE, no writes, no password spraying and no user enumeration**. Use it only against systems you are **explicitly authorized** to test.
+It performs **no exploitation, no RCE, no writes, no password spraying and no logins**. The default run is passive recon + triage; an opt-in `--enum` mode does no-credential username harvesting (a checker — it never sends a password). Use it only against systems you are **explicitly authorized** to test.
+
+> For what you can actually do with each finding, see **[CHEATSHEET.ru.md](CHEATSHEET.ru.md)** (Russian).
 
 ---
 
@@ -79,6 +81,10 @@ python3 exchange_recon.py mail.corp.com -v
 
 # route through Burp/mitmproxy to inspect raw traffic
 python3 exchange_recon.py mail.corp.com --proxy http://127.0.0.1:8080 --active
+
+# username enumeration mode (no creds) — needs a user/email list
+python3 exchange_recon.py mail.corp.com --enum -U users.txt --domain CORP
+python3 exchange_recon.py mail.corp.com --enum -U emails.txt --enum-method autodiscover
 ```
 
 `hosts.txt` is one target per line (`#` comments allowed); targets may be `host`, `host:port`, or `https://host`.
@@ -94,6 +100,11 @@ python3 exchange_recon.py mail.corp.com --proxy http://127.0.0.1:8080 --active
 | `-t, --timeout` | per-request timeout in seconds (default `8`) |
 | `-w, --workers` | concurrent endpoint probes per host (default `8`) |
 | `--active` | run **non-destructive** active confirmation probes (ProxyLogon SSRF, ProxyShell path-confusion) |
+| `--enum` | separate no-cred username-harvest mode (needs `-U`); never sends a password |
+| `-U, --userlist FILE` | users/emails to test, one per line (for `--enum`) |
+| `--enum-method` | `auto` (default) / `autodiscover` / `timing` |
+| `--domain` | AD/NetBIOS domain or UPN suffix to qualify bare usernames |
+| `--enum-samples` | timing samples per user (default 3) |
 | `-j, --json FILE` | write JSON report to `FILE` (`-` for stdout) |
 | `--proxy URL` | send all traffic through an HTTP proxy |
 | `--ua STRING` | override the User-Agent |
@@ -158,6 +169,25 @@ Version gating compares the **(CU, SU)** build octets, so product lines with a s
   - **ProxyShell (CVE-2021-34473)** — confirms the Autodiscover path-confusion via a `302` vs `400` status. No PowerShell/RCE stage is sent.
 
   A confirmed probe upgrades the verdict to `VULNERABLE` and overrides version-based guessing.
+
+---
+
+## Username enumeration mode (`--enum`)
+
+A **separate, opt-in** mode that harvests valid usernames **without credentials**. It is a *checker* — it decides `valid` / `unknown` / `invalid` and **never sends a password or logs in**. Requires a user/email list (`-U`).
+
+```bash
+python3 exchange_recon.py mail.corp.com --enum -U users.txt --domain CORP
+```
+
+Two techniques (`--enum-method auto|autodiscover|timing`):
+
+- **autodiscover** — `GET /autodiscover/autodiscover.json?Email=<u>` and compares the response to an invalid-user control (status / body / `X-BackEndCookie`). Quiet and precise; wants email format.
+- **timing** — sends Basic auth `<principal>:<bogus-pass>` to an NTLM vdir and measures latency against a random-user baseline; valid users trend slower. Noisier; works with bare usernames + `--domain`.
+
+Both are **heuristic and config-dependent** — confirm `valid` hits with a second method before spraying. What to do with the results is in [CHEATSHEET.ru.md](CHEATSHEET.ru.md#user-enum-surface).
+
+Every non-CVE weakness in the normal report also prints a **`how-to:` hint** pointing at the relevant cheatsheet section.
 
 ---
 
