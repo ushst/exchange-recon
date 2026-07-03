@@ -41,6 +41,7 @@ import struct
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
 from typing import Iterable, Optional
@@ -212,6 +213,21 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
         return None
 
 
+class _SameHostRedirect(urllib.request.HTTPRedirectHandler):
+    """Follow redirects, but never off the original host. A hybrid Exchange
+    often 302s /owa/ to login.microsoftonline.com; a scoped recon tool must not
+    wander off-target. Stateless — safe to share across the probe threads."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        new = super().redirect_request(req, fp, code, msg, headers, newurl)
+        if new is None:
+            return None
+        if urllib.parse.urlsplit(newurl).netloc != \
+                urllib.parse.urlsplit(req.full_url).netloc:
+            return None
+        return new
+
+
 class HttpClient:
     def __init__(self, timeout: float = 8.0, verify: bool = False,
                  proxy: Optional[str] = None, ua: Optional[str] = None,
@@ -227,7 +243,7 @@ class HttpClient:
         if proxy:
             base.append(urllib.request.ProxyHandler(
                 {"http": proxy, "https": proxy}))
-        self.opener = urllib.request.build_opener(*base)
+        self.opener = urllib.request.build_opener(*base, _SameHostRedirect())
         self.opener_noredir = urllib.request.build_opener(*base, _NoRedirect())
         self.ua = ua or (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -388,7 +404,10 @@ class ExchangeRecon:
     # --- discovery + fingerprint ------------------------------------------
     def probe_endpoint(self, path: str, ntlm: bool) -> Finding:
         url = self.host + path
-        r = self.http.request(url, method="GET")
+        # Map the RAW status: don't follow redirects, so a 302 is reported as
+        # 302 (not the 200 of the page it lands on) and we never chase an
+        # off-host login redirect.
+        r = self.http.request(url, method="GET", allow_redirects=False)
         f = Finding(endpoint=path, status=r["status"])
         if r["error"]:
             f.note = f"error: {r['error']}"
@@ -398,6 +417,15 @@ class ExchangeRecon:
 
         # Version disclosure via headers / body (OWA build path).
         self._harvest_version(hdrs, r["body"])
+        # The build often lives only in the logon page body, behind the /owa/
+        # (or /ecp/) redirect. If we still don't know it, follow once (same-host
+        # only) to harvest from the landing page — the redirect map already has
+        # the raw status above, so this extra GET is purely for fingerprinting.
+        if self.build is None and r["status"] in (301, 302) and \
+                ("owa" in path or "ecp" in path):
+            fr = self.http.request(url, method="GET", allow_redirects=True)
+            if not fr["error"]:
+                self._harvest_version(fr["headers"], fr["body"])
 
         # Anything that responds like Exchange flips the flag.
         if any(k in hdrs for k in VERSION_HEADER_KEYS) or "owa" in path or \
@@ -826,9 +854,12 @@ class UserEnumerator:
 
     # -- AutodiscoverV2 method --------------------------------------------
     def _autodiscover_probe(self, email: str) -> dict:
-        path = (f"/autodiscover/autodiscover.json?Email={email}"
-                f"&Protocol=ActiveSync")
-        return self.http.request(self.host + path, allow_redirects=False)
+        # URL-encode the query: '+', '&', '%', spaces etc. are legal in an email
+        # local-part and would otherwise break the parameters / silently corrupt
+        # the address being tested.
+        q = urllib.parse.urlencode({"Email": email, "Protocol": "ActiveSync"})
+        url = f"{self.host}/autodiscover/autodiscover.json?{q}"
+        return self.http.request(url, allow_redirects=False)
 
     def autodiscover(self, users: list[str]) -> list[EnumResult]:
         # Control: a couple of definitely-invalid addresses to learn the
