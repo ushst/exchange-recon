@@ -207,8 +207,11 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
 
 class HttpClient:
     def __init__(self, timeout: float = 8.0, verify: bool = False,
-                 proxy: Optional[str] = None, ua: Optional[str] = None):
+                 proxy: Optional[str] = None, ua: Optional[str] = None,
+                 verbose: bool = False):
         self.timeout = timeout
+        self.verbose = verbose
+        self.request_count = 0
         ctx = ssl.create_default_context()
         if not verify:
             ctx.check_hostname = False
@@ -232,11 +235,12 @@ class HttpClient:
             hdrs.update(headers)
         req = urllib.request.Request(url, method=method, headers=hdrs)
         opener = self.opener if allow_redirects else self.opener_noredir
+        self.request_count += 1
         t0 = time.perf_counter()
         try:
             resp = opener.open(req, timeout=self.timeout)
             body = resp.read(65536)
-            return {
+            out = {
                 "status": resp.status,
                 "headers": {k.lower(): v for k, v in resp.headers.items()},
                 "body": body,
@@ -245,7 +249,7 @@ class HttpClient:
             }
         except urllib.error.HTTPError as e:
             # 401/403/500 are all interesting for Exchange fingerprinting.
-            return {
+            out = {
                 "status": e.code,
                 "headers": {k.lower(): v for k, v in (e.headers or {}).items()},
                 "body": (e.read(65536) if hasattr(e, "read") else b""),
@@ -253,8 +257,22 @@ class HttpClient:
                 "error": None,
             }
         except Exception as e:  # noqa: BLE001 - network layer is noisy by nature
-            return {"status": None, "headers": {}, "body": b"",
-                    "elapsed": time.perf_counter() - t0, "error": str(e)}
+            out = {"status": None, "headers": {}, "body": b"",
+                   "elapsed": time.perf_counter() - t0, "error": str(e)}
+        self._log(method, url, out, "NTLM" in (headers or {}).get(
+            "Authorization", ""))
+        return out
+
+    def _log(self, method: str, url: str, out: dict, ntlm: bool):
+        if not self.verbose:
+            return
+        ms = out["elapsed"] * 1000
+        tag = out["status"] if out["status"] is not None else (
+            f"ERR {out['error']}")
+        extra = " [ntlm-negotiate]" if ntlm else ""
+        sys.stderr.write(
+            f"  -> {method:4} {url}  ==> {tag} ({ms:.0f} ms){extra}\n")
+        sys.stderr.flush()
 
 
 # ---------------------------------------------------------------------------
@@ -712,6 +730,9 @@ def main(argv: Optional[list[str]] = None) -> int:
     p.add_argument("--verify-tls", action="store_true",
                    help="verify TLS certs (default: off, self-signed common)")
     p.add_argument("--no-color", action="store_true", help="disable ANSI color")
+    p.add_argument("-v", "--verbose", action="store_true",
+                   help="log every HTTP request (method, URL, status, timing) "
+                        "to stderr — proves requests are actually sent")
     p.add_argument("-q", "--quiet", action="store_true",
                    help="suppress the human-readable report (JSON only)")
     args = p.parse_args(argv)
@@ -723,9 +744,11 @@ def main(argv: Optional[list[str]] = None) -> int:
         Color.off()
 
     http = HttpClient(timeout=args.timeout, verify=args.verify_tls,
-                      proxy=args.proxy, ua=args.ua)
+                      proxy=args.proxy, ua=args.ua, verbose=args.verbose)
     reports = []
     for tgt in targets:
+        if args.verbose:
+            sys.stderr.write(f"[*] scanning {tgt} ...\n")
         rec = ExchangeRecon(tgt, http, active=args.active)
         try:
             rec.run_discovery(workers=args.workers)
@@ -737,6 +760,10 @@ def main(argv: Optional[list[str]] = None) -> int:
         reports.append(rep)
         if not args.quiet:
             print_report(rep)
+
+    if args.verbose:
+        sys.stderr.write(f"[*] total HTTP requests sent: "
+                         f"{http.request_count}\n")
 
     if args.json:
         payload = reports if len(reports) > 1 else reports[0]

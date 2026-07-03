@@ -48,6 +48,7 @@ python3 exchange_recon.py mail.target.com --proxy http://127.0.0.1:8080
 | `-j, --json` | write JSON report to FILE (`-` for stdout) |
 | `--proxy` | proxy URL |
 | `--verify-tls` | verify TLS certs (default off — self-signed is common on Exchange) |
+| `-v, --verbose` | log every HTTP request (method, URL, status, timing) to stderr |
 | `--no-color` | disable ANSI color |
 | `-q, --quiet` | JSON only, suppress the human report |
 
