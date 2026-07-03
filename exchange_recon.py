@@ -83,6 +83,16 @@ PRODUCT_BY_MAJORMINOR = {
     (8, 3): "Exchange Server 2007",
 }
 
+# Products past end-of-support: no vendor patches ship for CVEs disclosed after
+# their EOL date, so a CVE simply "not listing" them does NOT mean safe — it
+# usually means permanently exposed. (2013: 2023-04-11, 2010: 2020-10-13,
+# 2007: 2017-04-11.)
+EOL_PRODUCTS = {
+    "Exchange Server 2013",
+    "Exchange Server 2010 SP3",
+    "Exchange Server 2007",
+}
+
 # ---------------------------------------------------------------------------
 # CVE knowledge base. Each entry describes how we *infer* exposure. Because this
 # is a non-destructive scanner we do version/exposure reasoning, not live PoC.
@@ -97,7 +107,10 @@ class CVE:
     name: str
     impact: str
     auth: str
-    # product-line -> minimum patched build (3rd octet). Missing line => n/a.
+    # product-line -> minimum patched build. Value is either the 3rd octet
+    # (CU-level gate, e.g. 1118) or a (3rd, 4th) tuple for SU-level gates where
+    # the CU number is static and only the SU moves (e.g. 2013 = 15.0.1497.X,
+    # so (1497, 44)). Missing line => not in this CVE's affected product list.
     fixed: dict
     # endpoints whose presence indicates the attack surface exists
     surface: list
@@ -115,7 +128,7 @@ CVE_DB: list[CVE] = [
         impact="Pre-auth SSRF -> chained RCE (CVE-2021-27065 write)",
         auth="None",
         fixed={"Exchange Server 2019": 858, "Exchange Server 2016": 2176,
-               "Exchange Server 2013": 1497},
+               "Exchange Server 2013": (1497, 12)},
         surface=["/owa/", "/ecp/", "/autodiscover/autodiscover.xml"],
         opsec="high",
         notes="Actively exploited 2021. Version-gate below CU + March 2021 patch.",
@@ -127,7 +140,7 @@ CVE_DB: list[CVE] = [
         impact="Pre-auth RCE via ACL bypass + PowerShell EoP",
         auth="None",
         fixed={"Exchange Server 2019": 922, "Exchange Server 2016": 2308,
-               "Exchange Server 2013": 1497},
+               "Exchange Server 2013": (1497, 15)},
         surface=["/autodiscover/autodiscover.json", "/owa/", "/PowerShell/"],
         opsec="high",
         notes="Requires Autodiscover + PowerShell backend reachable.",
@@ -138,10 +151,12 @@ CVE_DB: list[CVE] = [
         name="ProxyNotShell (SSRF)",
         impact="Auth SSRF -> RCE (chained with CVE-2022-41082)",
         auth="Low-priv creds",
-        fixed={"Exchange Server 2019": 1118, "Exchange Server 2016": 2507},
+        fixed={"Exchange Server 2019": 1118, "Exchange Server 2016": (2507, 16),
+               "Exchange Server 2013": (1497, 44)},
         surface=["/autodiscover/autodiscover.json", "/PowerShell/"],
         opsec="medium",
-        notes="Needs valid mailbox creds; detection is version-based only.",
+        notes="Nov 2022 patch. 2013 gated by SU (15.0.1497.44); needs valid "
+              "mailbox creds to exploit — detection is version-based only.",
     ),
     CVE(
         cve="CVE-2023-23397",
@@ -158,10 +173,13 @@ CVE_DB: list[CVE] = [
         name="NTLM relay to Exchange",
         impact="Relay captured NTLMv2 -> Exchange, no crack needed",
         auth="None (relay)",
-        fixed={"Exchange Server 2019": 1544},  # 2019 CU14 with EP enabled
+        # 2019 CU14 (15.2.1544.4) & 2016 CU23 Feb-2024 SU (15.1.2507.37) ship EP
+        # on by default. 2013 was EOL (no fix) -> handled via EOL_PRODUCTS.
+        fixed={"Exchange Server 2019": 1544, "Exchange Server 2016": (2507, 37)},
         surface=["/EWS/Exchange.asmx", "/Microsoft-Server-ActiveSync"],
         opsec="medium",
-        notes="Mitigated by Extended Protection (EP), enabled by default in 2019 CU14.",
+        notes="Mitigated by Extended Protection (EP), default-on from 2019 CU14 "
+              "/ 2016 CU23 Feb-2024 SU. Pre-EP builds relay-exposed.",
     ),
     CVE(
         cve="CVE-2024-21413",
@@ -544,17 +562,29 @@ class ExchangeRecon:
 
         # version gate
         if cve.fixed and self.build_tuple and self.product:
-            fixed_octet = cve.fixed.get(self.product)
-            if fixed_octet is None:
+            fixed = cve.fixed.get(self.product)
+            # Compare on (CU, SU) i.e. the 3rd+4th build octets. Some product
+            # lines (notably 2013 = 15.0.1497.X) only move the SU, so a CU-only
+            # gate would be meaningless — hence the tuple.
+            cur = (self.build_tuple[2], self.build_tuple[3])
+            if fixed is None:
+                # Product not listed by this CVE. For EOL products that usually
+                # means "never patched", not "safe".
+                if self.product in EOL_PRODUCTS:
+                    return "LIKELY", (
+                        f"{self.product} is end-of-life and received no fix "
+                        f"for this CVE; surface reachable — treat as exposed.")
                 return "CANDIDATE", (
                     f"Surface present; {self.product} not in this CVE's "
                     f"affected product list — verify manually.")
-            cur = self.build_tuple[2]
-            if cur >= fixed_octet:
+            patched = fixed if isinstance(fixed, tuple) else (fixed, 0)
+            cur_s = f"{cur[0]}.{cur[1]}"
+            pat_s = f"{patched[0]}.{patched[1]}"
+            if cur >= patched:
                 return "PATCHED", (
-                    f"{self.product} build .{cur} >= patched .{fixed_octet}.")
+                    f"{self.product} build {cur_s} >= patched {pat_s}.")
             return "LIKELY", (
-                f"{self.product} build .{cur} < patched .{fixed_octet} "
+                f"{self.product} build {cur_s} < patched {pat_s} "
                 f"and surface reachable.")
 
         # surface present but no version resolved
