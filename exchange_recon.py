@@ -542,6 +542,9 @@ class ExchangeRecon:
                 "name": cve.name,
                 "impact": cve.impact,
                 "auth": cve.auth,
+                # True => confirming this flaw needs valid credentials; the
+                # verdict here is version-based triage only, not a live check.
+                "auth_required": "cred" in cve.auth.lower(),
                 "opsec": cve.opsec,
                 "verdict": verdict,
                 "reason": reason,
@@ -744,11 +747,16 @@ class Color:
             setattr(cls, a, "")
 
 
-VERDICT_COLOR = {
-    "VULNERABLE": Color.BOLD + Color.R, "LIKELY": Color.R,
-    "CANDIDATE": Color.Y, "ADVISORY": Color.B,
-    "PATCHED": Color.G, "N/A": Color.DIM,
+# Map verdict -> Color attribute names; resolved at print time so --no-color
+# (which mutates Color after import) is honored.
+VERDICT_STYLE = {
+    "VULNERABLE": ("BOLD", "R"), "LIKELY": ("R",), "CANDIDATE": ("Y",),
+    "ADVISORY": ("B",), "PATCHED": ("G",), "N/A": ("DIM",),
 }
+
+
+def verdict_color(verdict: str) -> str:
+    return "".join(getattr(Color, a) for a in VERDICT_STYLE.get(verdict, ()))
 
 
 def print_report(rep: dict):
@@ -790,13 +798,26 @@ def print_report(rep: dict):
             print(f"            {C.DIM}ref: {w['ref']}{C.X}")
 
     mode = "active probes ON" if rep.get("active_mode") else "passive (version-based)"
-    print(f"\n{C.BOLD}CVE assessment{C.X} {C.DIM}[{mode}]{C.X}")
-    print(f"  {C.DIM}verdict     cve              opsec   name{C.X}")
-    for c in rep["cve_assessment"]:
-        col = VERDICT_COLOR.get(c["verdict"], "")
-        print(f"  {col}{c['verdict']:<11}{C.X} {c['cve']:<16} "
-              f"{c['opsec']:<7} {c['name']}")
-        print(f"      {C.DIM}{c['reason']}{C.X}")
+    cves = rep["cve_assessment"]
+    unauth = [c for c in cves if not c.get("auth_required")]
+    authreq = [c for c in cves if c.get("auth_required")]
+
+    def _print_cve_rows(rows):
+        print(f"  {C.DIM}verdict     cve              opsec   name{C.X}")
+        for c in rows:
+            col = verdict_color(c["verdict"])
+            print(f"  {col}{c['verdict']:<11}{C.X} {c['cve']:<16} "
+                  f"{c['opsec']:<7} {c['name']}")
+            print(f"      {C.DIM}{c['reason']}{C.X}")
+
+    print(f"\n{C.BOLD}CVE assessment — unauthenticated{C.X} {C.DIM}[{mode}]{C.X}")
+    _print_cve_rows(unauth)
+
+    if authreq:
+        print(f"\n{C.BOLD}CVE assessment — requires valid credentials{C.X} "
+              f"{C.DIM}(verdict is version-based triage only; confirming needs "
+              f"a mailbox login — not attempted){C.X}")
+        _print_cve_rows(authreq)
     print()
 
 
@@ -812,12 +833,59 @@ def read_targets(args) -> list[str]:
     return targets
 
 
+_HELP_DESCRIPTION = """\
+exchange_recon — non-destructive on-prem Microsoft Exchange recon & CVE triage.
+
+DETECTION ONLY. No exploitation, no RCE, no writes, no password spraying, no
+user enumeration. It maps endpoints, fingerprints the exact build, extracts the
+AD domain/host/OS from an unauthenticated NTLM negotiate, then reports:
+  * Weaknesses / exposures  — non-CVE findings (info leaks, enum/spray surface,
+                              exposed ECP/PowerShell/ActiveSync, EOL software)
+  * CVE assessment          — split into unauthenticated vs. requires-credentials
+"""
+
+_HELP_EPILOG = """\
+examples:
+  # single host, passive (safe default)
+  exchange_recon.py mail.corp.com
+
+  # watch every request being sent (method, URL, status, timing)
+  exchange_recon.py mail.corp.com -v
+
+  # add non-destructive active confirmation probes (ProxyLogon SSRF,
+  # ProxyShell path-confusion) — confirms flaws WITHOUT exploiting them
+  exchange_recon.py mail.corp.com --active
+
+  # many hosts from a file, JSON report, quiet console
+  exchange_recon.py -f hosts.txt --active -j report.json -q
+
+  # route everything through Burp/mitmproxy to inspect raw traffic
+  exchange_recon.py mail.corp.com --proxy http://127.0.0.1:8080 --active
+
+verdict legend (CVE):
+  VULNERABLE  active probe confirmed the flaw (not exploited)
+  LIKELY      disclosed build < patched build AND surface reachable
+  CANDIDATE   surface reachable but exact build not disclosed — verify
+  ADVISORY    client-side issue, flagged because Exchange is present
+  PATCHED     build at/above patched level, or active probe rejected
+  N/A         required attack surface not reachable
+
+notes:
+  * "requires valid credentials" CVEs (e.g. ProxyNotShell) are shown in a
+    separate block; their verdict is version-based triage only — the tool
+    does NOT authenticate or exploit to confirm them.
+  * exit is 0 on completion; findings are in the report, not the exit code.
+
+Authorized testing only. You are solely responsible for scope and legality.
+"""
+
+
 def main(argv: Optional[list[str]] = None) -> int:
     p = argparse.ArgumentParser(
-        prog="exchange_recon",
-        description="Non-destructive on-prem Exchange recon & CVE triage "
-                    "(detection only — no exploitation).",
-        epilog="Authorized testing only. You are responsible for scope.",
+        prog="exchange_recon.py",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        description=_HELP_DESCRIPTION,
+        epilog=_HELP_EPILOG,
     )
     p.add_argument("target", nargs="*",
                    help="host(s): host, host:port, or https://host")
