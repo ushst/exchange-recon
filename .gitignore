@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+*.json
+!package.json
+report*.json
+hosts.txt
